@@ -16,9 +16,11 @@ app.use((req, res, next) => {
 // /foods/search shape and the app's existing parser works unchanged.
 const NUTRIENT_NUMBERS = {
   calories: '208', protein: '203', carbs: '205', fat: '204',
-  fiber: '291', sugar: '269', sodium: '307', potassium: '306',
-  calcium: '301', iron: '303', vitamin_c: '401', vitamin_a: '320',
-  vitamin_d: '328', vitamin_b12: '418'
+  saturated_fat: '606', trans_fat: '605', monounsat_fat: '645', polyunsat_fat: '646',
+  fiber: '291', sugar: '269', added_sugars: '539', sugar_alcohol: '299',
+  sodium: '307', potassium: '306', calcium: '301', iron: '303',
+  vitamin_a: '320', vitamin_c: '401', vitamin_d: '328', vitamin_b6: '415',
+  vitamin_b12: '418', vitamin_k1: '430', vitamin_k2: '428'
 };
 
 app.get('/api/foods/search', async (req, res) => {
@@ -30,8 +32,12 @@ app.get('/api/foods/search', async (req, res) => {
     // stronger of the two, boosted for generic whole foods so they surface
     // above the ~1.9M branded products.
     const { rows } = await pool.query(
-      `SELECT description, brand, calories, protein, carbs, fat, fiber, sugar,
-              sodium, potassium, calcium, iron, vitamin_c, vitamin_a, vitamin_d, vitamin_b12
+      `SELECT description, brand, calories, protein, carbs, fat,
+              saturated_fat, trans_fat, monounsat_fat, polyunsat_fat,
+              fiber, sugar, added_sugars, sugar_alcohol,
+              sodium, potassium, calcium, iron,
+              vitamin_a, vitamin_c, vitamin_d, vitamin_b6,
+              vitamin_b12, vitamin_k1, vitamin_k2
        FROM foods
        WHERE search_tsv @@ plainto_tsquery('english', $1)
           OR description % $1
@@ -49,7 +55,10 @@ app.get('/api/foods/search', async (req, res) => {
       for (const [col, number] of Object.entries(NUTRIENT_NUMBERS)) {
         if (r[col] != null) foodNutrients.push({ nutrientNumber: number, value: Number(r[col]) });
       }
-      return { description: r.description, brandName: r.brand || '', foodNutrients };
+      const netCarbs = (r.carbs != null && r.fiber != null)
+        ? Math.max(0, Number(r.carbs) - Number(r.fiber))
+        : null;
+      return { description: r.description, brandName: r.brand || '', netCarbs, foodNutrients };
     });
 
     res.json({ foods });
