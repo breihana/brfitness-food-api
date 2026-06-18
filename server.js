@@ -30,7 +30,9 @@ app.get('/api/foods/search', async (req, res) => {
   try {
     // Match on full-text OR trigram similarity (typo tolerance). Score by the
     // stronger of the two, boosted for generic whole foods so they surface
-    // above the ~1.9M branded products.
+    // above the ~1.9M branded products. The 3x boost is deliberate: a branded
+    // item literally named "BANANA" scores similarity ~1.0, while "Bananas, raw"
+    // scores ~0.45, so a smaller boost left whole foods buried under branded hits.
     const { rows } = await pool.query(
       `SELECT description, brand, calories, protein, carbs, fat,
               saturated_fat, trans_fat, monounsat_fat, polyunsat_fat,
@@ -45,7 +47,7 @@ app.get('/api/foods/search', async (req, res) => {
                   ts_rank(search_tsv, plainto_tsquery('english', $1)),
                   similarity(description, $1)
                 ) * CASE WHEN data_type IN ('foundation_food', 'sr_legacy_food')
-                         THEN 1.5 ELSE 1.0 END DESC
+                         THEN 3.0 ELSE 1.0 END DESC
        LIMIT 20`,
       [q]
     );
