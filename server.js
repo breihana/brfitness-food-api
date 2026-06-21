@@ -34,7 +34,8 @@ app.get('/api/foods/search', async (req, res) => {
     // item literally named "BANANA" scores similarity ~1.0, while "Bananas, raw"
     // scores ~0.45, so a smaller boost left whole foods buried under branded hits.
     const { rows } = await pool.query(
-      `SELECT description, brand, calories, protein, carbs, fat,
+      `SELECT description, brand, serving_size, serving_size_unit,
+              calories, protein, carbs, fat,
               saturated_fat, trans_fat, monounsat_fat, polyunsat_fat,
               fiber, sugar, added_sugars, sugar_alcohol,
               sodium, potassium, calcium, iron,
@@ -62,7 +63,14 @@ app.get('/api/foods/search', async (req, res) => {
       const netCarbs = (r.carbs != null && r.fiber != null)
         ? Math.max(0, Number(r.carbs) - Number(r.fiber))
         : null;
-      return { description: r.description, brandName: r.brand || '', netCarbs, foodNutrients };
+      return {
+        description: r.description,
+        brandName: r.brand || '',
+        servingSize: r.serving_size != null ? Number(r.serving_size) : null,
+        servingSizeUnit: r.serving_size_unit || null,
+        netCarbs,
+        foodNutrients
+      };
     });
 
     res.json({ foods });
