@@ -26,6 +26,9 @@ const NUTRIENT_NUMBERS = {
 app.get('/api/foods/search', async (req, res) => {
   const q = (req.query.q || '').trim();
   if (!q) return res.json({ foods: [] });
+  // The app sends the device-region country (no personal data): name + code.
+  const countryName = (req.query.country_name || '').trim();
+  const countryCode = (req.query.country || '').trim();
 
   try {
     // Match on full-text OR trigram similarity (typo tolerance). Score by the
@@ -33,8 +36,11 @@ app.get('/api/foods/search', async (req, res) => {
     // above the ~1.9M branded products. The 3x boost is deliberate: a branded
     // item literally named "BANANA" scores similarity ~1.0, while "Bananas, raw"
     // scores ~0.45, so a smaller boost left whole foods buried under branded hits.
+    //
+    // Hard local-first: rows whose market_country matches the user's region sort
+    // above everything else; the whole-food boost only breaks ties among the rest.
     const { rows } = await pool.query(
-      `SELECT description, brand, serving_size, serving_size_unit,
+      `SELECT description, brand, market_country, serving_size, serving_size_unit,
               calories, protein, carbs, fat,
               saturated_fat, trans_fat, monounsat_fat, polyunsat_fat,
               fiber, sugar, added_sugars, sugar_alcohol,
@@ -45,14 +51,17 @@ app.get('/api/foods/search', async (req, res) => {
        WHERE search_tsv @@ plainto_tsquery('english', $1)
           OR description % $1
           OR brand % $1
-       ORDER BY GREATEST(
+       ORDER BY (CASE WHEN ($2 <> '' OR $3 <> '')
+                       AND LOWER(COALESCE(market_country, '')) IN (LOWER($2), LOWER($3))
+                      THEN 1 ELSE 0 END) DESC,
+                GREATEST(
                   ts_rank(search_tsv, plainto_tsquery('english', $1)),
                   similarity(description, $1),
                   similarity(brand, $1)
                 ) * CASE WHEN data_type IN ('foundation_food', 'sr_legacy_food')
                          THEN 3.0 ELSE 1.0 END DESC
        LIMIT 20`,
-      [q]
+      [q, countryName, countryCode]
     );
 
     const foods = rows.map(r => {
@@ -66,6 +75,7 @@ app.get('/api/foods/search', async (req, res) => {
       return {
         description: r.description,
         brandName: r.brand || '',
+        market_country: r.market_country || null,
         servingSize: r.serving_size != null ? Number(r.serving_size) : null,
         servingSizeUnit: r.serving_size_unit || null,
         netCarbs,
