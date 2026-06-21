@@ -23,8 +23,11 @@ CREATE TABLE IF NOT EXISTS foods (
   vitamin_a    DOUBLE PRECISION,
   vitamin_d    DOUBLE PRECISION,
   vitamin_b12  DOUBLE PRECISION,
-  search_tsv   tsvector GENERATED ALWAYS AS (to_tsvector('english', description)) STORED
+  search_tsv   tsvector GENERATED ALWAYS AS
+                 (to_tsvector('english', description || ' ' || coalesce(brand, ''))) STORED
 );
 
 CREATE INDEX IF NOT EXISTS idx_foods_search ON foods USING GIN(search_tsv);
 CREATE INDEX IF NOT EXISTS idx_foods_trgm ON foods USING GIN(description gin_trgm_ops);
+-- Brand trigram index so brand-name search ("burgerfuel") is fast and typo-tolerant.
+CREATE INDEX IF NOT EXISTS idx_foods_brand_trgm ON foods USING GIN(brand gin_trgm_ops);

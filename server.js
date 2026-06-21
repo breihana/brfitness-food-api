@@ -43,9 +43,11 @@ app.get('/api/foods/search', async (req, res) => {
        FROM foods
        WHERE search_tsv @@ plainto_tsquery('english', $1)
           OR description % $1
+          OR brand % $1
        ORDER BY GREATEST(
                   ts_rank(search_tsv, plainto_tsquery('english', $1)),
-                  similarity(description, $1)
+                  similarity(description, $1),
+                  similarity(brand, $1)
                 ) * CASE WHEN data_type IN ('foundation_food', 'sr_legacy_food')
                          THEN 3.0 ELSE 1.0 END DESC
        LIMIT 20`,
