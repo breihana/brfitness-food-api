@@ -32,12 +32,16 @@ app.get('/api/foods/search', async (req, res) => {
 
   try {
     // Split query into keywords, require ALL to appear (case-insensitive) in description/brand combined.
-    const keywords = q.toLowerCase().split(/\s+/).filter(k => k.length > 0);
+    // Strip apostrophes (straight, curly, backtick, acute) so "Egg'd", "Egg’d" (iOS smart
+    // quote) and "Eggd" all match the stored "EGG'D" — the brand column uses a straight ' .
+    const stripQuotes = s => s.replace(/[’'`´]/g, '');
+    const keywords = stripQuotes(q.toLowerCase()).split(/\s+/).filter(k => k.length > 0);
     const combined = `${countryName}${countryCode}`;  // dummy to preserve param positions
 
-    // Build WHERE: all keywords must match (case-insensitive substring)
+    // Build WHERE: all keywords must match (case-insensitive substring), with apostrophes
+    // stripped from the searched text too so the match is apostrophe-insensitive both ways.
     let whereConditions = keywords
-      .map((_, i) => `LOWER(COALESCE(description, '') || ' ' || COALESCE(brand, '')) ILIKE $${i + 4}`)
+      .map((_, i) => `REPLACE(REPLACE(REPLACE(LOWER(COALESCE(description, '') || ' ' || COALESCE(brand, '')), '’', ''), '''', ''), '\`', '') ILIKE $${i + 4}`)
       .join(' AND ');
 
     const { rows } = await pool.query(
