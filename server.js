@@ -25,23 +25,25 @@ const NUTRIENT_NUMBERS = {
 
 app.get('/api/foods/search', async (req, res) => {
   const q = (req.query.q || '').trim();
-  if (!q) return res.json({ foods: [] });
+  if (q.length < 3) return res.json({ foods: [] });
   // The app sends the device-region country (no personal data): name + code.
   const countryName = (req.query.country_name || '').trim();
   const countryCode = (req.query.country || '').trim();
 
   try {
-    // Split query into keywords, require ALL to appear (case-insensitive) in description/brand combined.
-    // Strip apostrophes (straight, curly, backtick, acute) so "Egg'd", "Egg’d" (iOS smart
-    // quote) and "Eggd" all match the stored "EGG'D" — the brand column uses a straight ' .
-    const stripQuotes = s => s.replace(/[’'`´]/g, '');
-    const keywords = stripQuotes(q.toLowerCase()).split(/\s+/).filter(k => k.length > 0);
-    const combined = `${countryName}${countryCode}`;  // dummy to preserve param positions
+    // Normalize smart-quote variants to the straight apostrophes used by USDA data, then
+    // require every keyword to appear in either description or brand. Keep the indexed
+    // columns bare in these predicates: wrapping/concatenating them prevents PostgreSQL
+    // from using idx_foods_desc_trgm and idx_foods_brand_trgm.
+    const normalizedQuery = q.toLowerCase().replace(/[’`´]/g, "'");
+    const keywords = normalizedQuery.split(/\s+/).filter(k => k.length > 0);
 
-    // Build WHERE: all keywords must match (case-insensitive substring), with apostrophes
-    // stripped from the searched text too so the match is apostrophe-insensitive both ways.
+    // pg_trgm cannot accelerate a query made only of one- or two-character terms.
+    // Refuse that edge case rather than allowing it to scan all two million foods.
+    if (!keywords.some(k => k.length >= 3)) return res.json({ foods: [] });
+
     let whereConditions = keywords
-      .map((_, i) => `REPLACE(REPLACE(REPLACE(LOWER(COALESCE(description, '') || ' ' || COALESCE(brand, '')), '’', ''), '''', ''), '\`', '') ILIKE $${i + 4}`)
+      .map((_, i) => `(description ILIKE $${i + 4} OR brand ILIKE $${i + 4})`)
       .join(' AND ');
 
     const { rows } = await pool.query(
@@ -63,7 +65,7 @@ app.get('/api/foods/search', async (req, res) => {
                 ) * CASE WHEN data_type IN ('foundation_food', 'sr_legacy_food')
                          THEN 3.0 ELSE 1.0 END DESC
        LIMIT 20`,
-      [q.toLowerCase(), countryName, countryCode, ...keywords.map(k => `%${k}%`)]
+      [normalizedQuery, countryName, countryCode, ...keywords.map(k => `%${k}%`)]
     );
 
     const foods = rows.map(r => {
