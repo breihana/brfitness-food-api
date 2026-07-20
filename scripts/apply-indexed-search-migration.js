@@ -4,11 +4,6 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { Client } = require('pg');
 
-const connectionString = process.env.DATABASE_URL;
-if (!connectionString) {
-  throw new Error('DATABASE_URL environment variable is required');
-}
-
 const migrationPath = path.resolve(
   __dirname,
   '..',
@@ -22,7 +17,18 @@ function statementLabel(statement) {
   return 'pg_trgm extension';
 }
 
+function migrationStatements(migrationSQL) {
+  return migrationSQL
+    .replace(/^\s*--.*$/gm, '')
+    .match(/CREATE\s+EXTENSION[\s\S]*?;|CREATE\s+INDEX[\s\S]*?;/gi);
+}
+
 async function main() {
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error('DATABASE_URL environment variable is required');
+  }
+
   const client = new Client({
     connectionString,
     ssl: /(?:localhost|127\.0\.0\.1)/.test(connectionString)
@@ -39,9 +45,7 @@ async function main() {
     await client.query('SET statement_timeout = 0');
 
     const migrationSQL = fs.readFileSync(migrationPath, 'utf8');
-    const statements = migrationSQL.match(
-      /CREATE\s+EXTENSION[\s\S]*?;|CREATE\s+INDEX[\s\S]*?;/gi
-    );
+    const statements = migrationStatements(migrationSQL);
     if (!statements || statements.length !== 4) {
       throw new Error('Unexpected indexed-search migration structure');
     }
@@ -100,11 +104,15 @@ async function main() {
   }
 }
 
-main().catch(error => {
-  console.error(JSON.stringify({
-    event: 'migration_failed',
-    errorCode: typeof error.code === 'string' ? error.code : 'UNKNOWN',
-    errorName: error.name
-  }));
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch(error => {
+    console.error(JSON.stringify({
+      event: 'migration_failed',
+      errorCode: typeof error.code === 'string' ? error.code : 'UNKNOWN',
+      errorName: error.name
+    }));
+    process.exit(1);
+  });
+}
+
+module.exports = { migrationStatements, statementLabel };
