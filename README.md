@@ -12,6 +12,7 @@ through Open Food Facts in the app.
 
 ```
 GET /api/foods/search?q=chicken
+GET /foods?search=chicken&brand=&market_country=NZ&limit=20
 ```
 
 Returns up to 20 matches, mirroring USDA's response:
@@ -32,6 +33,11 @@ Returns up to 20 matches, mirroring USDA's response:
 ```
 
 All nutrient values are per 100 g.
+
+Successful food-search responses are cacheable for 24 hours. The current app
+route (`q`, `country`, and `country_name`) remains supported; `search`, `brand`,
+`market_country`, and `limit` are also accepted on either route. `limit` defaults
+to 20 and must be between 1 and 100.
 
 ## Local setup
 

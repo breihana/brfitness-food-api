@@ -1,8 +1,26 @@
+'use strict';
+
 const express = require('express');
 const { pool } = require('./db');
 
 const app = express();
 const APP_SECRET = process.env.APP_SECRET;
+const FOOD_CACHE_CONTROL = 'public, max-age=86400';
+
+app.disable('x-powered-by');
+
+// Ensure every client-visible error is non-cacheable, including authentication
+// failures and Express responses added in the future.
+app.use((_req, res, next) => {
+  const send = res.send;
+  res.send = function sendWithoutCachingErrors(body) {
+    if (res.statusCode >= 400) {
+      res.set('Cache-Control', 'no-store');
+    }
+    return send.call(this, body);
+  };
+  next();
+});
 
 // Optional shared-secret gate — only enforced if APP_SECRET is set in the env.
 app.use((req, res, next) => {
@@ -23,27 +41,93 @@ const NUTRIENT_NUMBERS = {
   vitamin_b12: '418', vitamin_k1: '430', vitamin_k2: '428'
 };
 
-app.get('/api/foods/search', async (req, res) => {
-  const q = (req.query.q || '').trim();
-  if (!q) return res.json({ foods: [] });
-  // The app sends the device-region country (no personal data): name + code.
-  const countryName = (req.query.country_name || '').trim();
-  const countryCode = (req.query.country || '').trim();
+function stringQueryValue(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function requestedLimit(value) {
+  if (value === undefined) return 20;
+  if (typeof value !== 'string' || !/^\d+$/.test(value)) return null;
+  const limit = Number(value);
+  return Number.isSafeInteger(limit) && limit >= 1 && limit <= 100 ? limit : null;
+}
+
+function foodFromRow(row) {
+  const foodNutrients = [];
+  for (const [column, nutrientNumber] of Object.entries(NUTRIENT_NUMBERS)) {
+    if (row[column] !== null) {
+      foodNutrients.push({ nutrientNumber, value: Number(row[column]) });
+    }
+  }
+
+  const netCarbs = row.carbs !== null && row.fiber !== null
+    ? Math.max(0, Number(row.carbs) - Number(row.fiber))
+    : null;
+
+  return {
+    description: row.description,
+    brandName: row.brand || '',
+    market_country: row.market_country || null,
+    servingSize: row.serving_size !== null ? Number(row.serving_size) : null,
+    servingSizeUnit: row.serving_size_unit || null,
+    netCarbs,
+    foodNutrients
+  };
+}
+
+function sendFoods(res, foods) {
+  res.set('Cache-Control', FOOD_CACHE_CONTROL);
+  return res.json({ foods });
+}
+
+async function searchFoods(req, res) {
+  // Preserve the mobile app's q/country inputs and support the hardened API's
+  // search/brand/market_country/limit names on both food-search routes.
+  const search = stringQueryValue(req.query.search) || stringQueryValue(req.query.q);
+  const brand = stringQueryValue(req.query.brand);
+  const marketCountry = stringQueryValue(req.query.market_country);
+  const countryName = stringQueryValue(req.query.country_name);
+  const countryCode = stringQueryValue(req.query.country);
+  const limit = requestedLimit(req.query.limit);
+
+  if (limit === null) {
+    return res.status(400).json({ error: 'limit must be an integer from 1 to 100' });
+  }
+
+  if (!search && !brand && !marketCountry) {
+    return sendFoods(res, []);
+  }
 
   try {
-    // Split query into keywords, require ALL to appear (case-insensitive) in description/brand combined.
-    // Strip apostrophes (straight, curly, backtick, acute) so "Egg'd", "Egg’d" (iOS smart
-    // quote) and "Eggd" all match the stored "EGG'D" — the brand column uses a straight ' .
-    const stripQuotes = s => s.replace(/[’'`´]/g, '');
-    const keywords = stripQuotes(q.toLowerCase()).split(/\s+/).filter(k => k.length > 0);
-    const combined = `${countryName}${countryCode}`;  // dummy to preserve param positions
+    // Split search into keywords and require every keyword to occur in the
+    // combined description and brand. Apostrophe variants are ignored on both
+    // sides so Egg'd, Egg’d, and Eggd match consistently.
+    const stripQuotes = value => value.replace(/[’'`´]/g, '');
+    const keywords = stripQuotes(search.toLowerCase()).split(/\s+/).filter(Boolean);
+    const preferredCountryName = countryName || marketCountry;
+    const preferredCountryCode = countryCode;
+    const values = [search.toLowerCase(), preferredCountryName, preferredCountryCode];
+    const whereConditions = [];
 
-    // Build WHERE: all keywords must match (case-insensitive substring), with apostrophes
-    // stripped from the searched text too so the match is apostrophe-insensitive both ways.
-    let whereConditions = keywords
-      .map((_, i) => `REPLACE(REPLACE(REPLACE(LOWER(COALESCE(description, '') || ' ' || COALESCE(brand, '')), '’', ''), '''', ''), '\`', '') ILIKE $${i + 4}`)
-      .join(' AND ');
+    for (const keyword of keywords) {
+      values.push(`%${keyword}%`);
+      whereConditions.push(
+        `REPLACE(REPLACE(REPLACE(LOWER(COALESCE(description, '') || ' ' || COALESCE(brand, '')), '’', ''), '''', ''), '\`', '') ILIKE $${values.length}`
+      );
+    }
 
+    if (brand) {
+      values.push(`%${brand}%`);
+      whereConditions.push(`COALESCE(brand, '') ILIKE $${values.length}`);
+    }
+
+    if (marketCountry) {
+      values.push(marketCountry);
+      whereConditions.push(`LOWER(COALESCE(market_country, '')) = LOWER($${values.length})`);
+    }
+
+    values.push(limit);
+    const limitParameter = values.length;
     const { rows } = await pool.query(
       `SELECT description, brand, market_country, serving_size, serving_size_unit,
               calories, protein, carbs, fat,
@@ -53,7 +137,7 @@ app.get('/api/foods/search', async (req, res) => {
               vitamin_a, vitamin_c, vitamin_d, vitamin_b6,
               vitamin_b12, vitamin_k1, vitamin_k2
        FROM foods
-       WHERE ${whereConditions}
+       WHERE ${whereConditions.join(' AND ')}
        ORDER BY (CASE WHEN ($2 <> '' OR $3 <> '')
                        AND LOWER(COALESCE(market_country, '')) IN (LOWER($2), LOWER($3))
                       THEN 1 ELSE 0 END) DESC,
@@ -62,36 +146,68 @@ app.get('/api/foods/search', async (req, res) => {
                   similarity(LOWER(COALESCE(brand, '')), $1)
                 ) * CASE WHEN data_type IN ('foundation_food', 'sr_legacy_food')
                          THEN 3.0 ELSE 1.0 END DESC
-       LIMIT 20`,
-      [q.toLowerCase(), countryName, countryCode, ...keywords.map(k => `%${k}%`)]
+       LIMIT $${limitParameter}`,
+      values
     );
 
-    const foods = rows.map(r => {
-      const foodNutrients = [];
-      for (const [col, number] of Object.entries(NUTRIENT_NUMBERS)) {
-        if (r[col] != null) foodNutrients.push({ nutrientNumber: number, value: Number(r[col]) });
-      }
-      const netCarbs = (r.carbs != null && r.fiber != null)
-        ? Math.max(0, Number(r.carbs) - Number(r.fiber))
-        : null;
-      return {
-        description: r.description,
-        brandName: r.brand || '',
-        market_country: r.market_country || null,
-        servingSize: r.serving_size != null ? Number(r.serving_size) : null,
-        servingSizeUnit: r.serving_size_unit || null,
-        netCarbs,
-        foodNutrients
-      };
-    });
-
-    res.json({ foods });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+    return sendFoods(res, rows.map(foodFromRow));
+  } catch (error) {
+    console.error('Food search failed:', error);
+    return res.status(500).json({ error: 'Food search failed' });
   }
+}
+
+app.get(['/api/foods/search', '/foods'], searchFoods);
+
+app.get('/health', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  return res.json({ ok: true });
 });
 
-app.get('/health', (_req, res) => res.json({ ok: true }));
+app.use((error, _req, res, _next) => {
+  console.error('Unexpected API error:', error);
+  return res.status(500).json({ error: 'Internal server error' });
+});
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`BRFitness Food API listening on port ${port}`));
+app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
+
+function startServer(port = process.env.PORT || 3000) {
+  const server = app.listen(port, () => {
+    console.log(`BRFitness Food API listening on port ${port}`);
+  });
+  let shuttingDown = false;
+
+  const shutdown = signal => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`${signal} received; shutting down`);
+    server.close(async closeError => {
+      try {
+        await pool.end();
+      } catch (poolError) {
+        console.error('Failed to close PostgreSQL pool:', poolError);
+        process.exitCode = 1;
+      }
+      if (closeError) {
+        console.error('Failed to close HTTP server:', closeError);
+        process.exitCode = 1;
+      }
+    });
+  };
+
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => shutdown('SIGINT'));
+  return server;
+}
+
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = {
+  app,
+  FOOD_CACHE_CONTROL,
+  requestedLimit,
+  searchFoods,
+  startServer
+};
