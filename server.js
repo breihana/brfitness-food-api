@@ -95,6 +95,7 @@ function buildFoodSearchQuery({
     similarity(lower(coalesce(description, '')), $1),
     similarity(lower(coalesce(brand, '')), $1)
   )`;
+  let secondaryRankExpression = '';
 
   if (mode === 'fts') {
     values.push(search);
@@ -104,6 +105,11 @@ function buildFoodSearchQuery({
     );
     rankExpression =
       `ts_rank(search_tsv, plainto_tsquery('english', $${searchParameter}))`;
+    secondaryRankExpression = `,
+                    GREATEST(
+                      similarity(lower(coalesce(description, '')), $1),
+                      similarity(lower(coalesce(brand, '')), $1)
+                    ) DESC`;
   } else if (mode === 'substring') {
     for (const keyword of normalizedQuery.split(' ').filter(Boolean)) {
       values.push(literalContainsPattern(keyword));
@@ -146,7 +152,7 @@ function buildFoodSearchQuery({
                           THEN 1 ELSE 0 END) DESC,
                     ${rankExpression}
                     * CASE WHEN data_type IN ('foundation_food', 'sr_legacy_food')
-                           THEN 3.0 ELSE 1.0 END DESC
+                           THEN 3.0 ELSE 1.0 END DESC${secondaryRankExpression}
            LIMIT $${limitParameter}`,
     values
   };

@@ -99,6 +99,7 @@ test('food search remains compatible and is cacheable for 24 hours', async () =>
   assert.equal(response.headers.get('cache-control'), FOOD_CACHE_CONTROL);
   assert.equal(body.foods[0].description, 'Rolled oats');
   assert.match(captured[0], /search_tsv @@ plainto_tsquery\('english', \$4\)/);
+  assert.match(captured[0], /similarity\(lower\(coalesce\(description, ''\)\), \$1\)/);
   assert.equal(captured[1][0], 'rolled oats');
   assert.equal(captured[1][2], 'NZ');
   assert.equal(captured[1].at(-1), 20);
