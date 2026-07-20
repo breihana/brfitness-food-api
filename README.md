@@ -39,6 +39,37 @@ route (`q`, `country`, and `country_name`) remains supported; `search`, `brand`,
 `market_country`, and `limit` are also accepted on either route. `limit` defaults
 to 20 and must be between 1 and 100.
 
+## Search behavior
+
+Ordinary word searches use the `search_tsv` GIN index first. If full-text search
+returns no rows and the query contains an indexable term of at least three
+characters, the API performs one trigram-backed substring fallback. The
+fallback searches the indexed `description` and `brand` columns directly and an
+indexed normalized expression so `Egg'd`, `Egg’d`, and `Eggd` remain equivalent.
+
+Apply `migrations/20260721_indexed_search.sql` before deploying code that uses
+the normalized fallback. It creates indexes concurrently and therefore must be
+run with autocommit enabled, outside an explicit transaction. On a large live
+table, review the migration and query plans and obtain deployment approval
+before running it.
+
+PostgreSQL statements default to a 2500 ms server-side timeout, with a 3000 ms
+client-side read guard. The optional `DB_STATEMENT_TIMEOUT_MS` and
+`DB_QUERY_TIMEOUT_MS` settings can override those defaults. Timeout responses
+use HTTP 504 and are never cacheable.
+
+Each database-backed search emits one structured JSON log containing a request
+ID, bounded search inputs, query stages, result count, database duration, total
+request duration, and outcome. The same request ID is returned in the
+`X-Request-ID` response header. Secrets and database connection values are not
+logged.
+
+`diagnostics/search_statistics.sql` reports table statistics, planner row
+estimates, and index usage. `diagnostics/exact_food_count.sql` performs the more
+expensive exact count separately. The optional `pg_stat_statements` query is
+commented out because enabling that extension or changing hosted Postgres
+configuration is a separate production operation.
+
 ## Local setup
 
 1. `npm install`

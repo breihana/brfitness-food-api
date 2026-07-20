@@ -5,9 +5,10 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js && node --check db.js",
+    "check": "node --check server.js && node --check db.js && node --check scripts/apply-indexed-search-migration.js",
     "test": "node --test",
-    "import": "node import.js"
+    "import": "node import.js",
+    "migrate:indexed-search": "node scripts/apply-indexed-search-migration.js"
   },
   "dependencies": {
     "csv-parse": "^5.5.6",

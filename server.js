@@ -1,11 +1,15 @@
 'use strict';
 
+const { randomUUID } = require('node:crypto');
+const { performance } = require('node:perf_hooks');
 const express = require('express');
 const { pool } = require('./db');
 
 const app = express();
 const APP_SECRET = process.env.APP_SECRET;
 const FOOD_CACHE_CONTROL = 'public, max-age=86400';
+const NORMALIZED_SEARCH_EXPRESSION =
+  "regexp_replace(lower(coalesce(description, '') || ' ' || coalesce(brand, '')), '[‘’''`´]', '', 'g')";
 
 app.disable('x-powered-by');
 
@@ -22,7 +26,7 @@ app.use((_req, res, next) => {
   next();
 });
 
-// Optional shared-secret gate — only enforced if APP_SECRET is set in the env.
+// Optional shared-secret gate - only enforced if APP_SECRET is set in the env.
 app.use((req, res, next) => {
   if (APP_SECRET && req.headers['x-app-secret'] !== APP_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -50,6 +54,102 @@ function requestedLimit(value) {
   if (typeof value !== 'string' || !/^\d+$/.test(value)) return null;
   const limit = Number(value);
   return Number.isSafeInteger(limit) && limit >= 1 && limit <= 100 ? limit : null;
+}
+
+function normalizeSearch(value) {
+  return value
+    .toLowerCase()
+    .replace(/[\u2018\u2019'`\u00b4]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function literalContainsPattern(value) {
+  return `%${value.replace(/[\\%_]/g, character => `\\${character}`)}%`;
+}
+
+function safeLogValue(value) {
+  return value.replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 120);
+}
+
+function isQueryTimeout(error) {
+  return error && (
+    error.code === '57014' ||
+    /query read timeout|statement timeout/i.test(String(error.message || ''))
+  );
+}
+
+function buildFoodSearchQuery({
+  mode,
+  search,
+  brand,
+  marketCountry,
+  preferredCountryName,
+  preferredCountryCode,
+  limit
+}) {
+  const normalizedQuery = normalizeSearch(search);
+  const values = [normalizedQuery, preferredCountryName, preferredCountryCode];
+  const whereConditions = [];
+  let rankExpression = `GREATEST(
+    similarity(lower(coalesce(description, '')), $1),
+    similarity(lower(coalesce(brand, '')), $1)
+  )`;
+
+  if (mode === 'fts') {
+    values.push(search);
+    const searchParameter = values.length;
+    whereConditions.push(
+      `search_tsv @@ plainto_tsquery('english', $${searchParameter})`
+    );
+    rankExpression =
+      `ts_rank(search_tsv, plainto_tsquery('english', $${searchParameter}))`;
+  } else if (mode === 'substring') {
+    for (const keyword of normalizedQuery.split(' ').filter(Boolean)) {
+      values.push(literalContainsPattern(keyword));
+      const keywordParameter = values.length;
+      whereConditions.push(`(
+        description ILIKE $${keywordParameter} ESCAPE '\\'
+        OR brand ILIKE $${keywordParameter} ESCAPE '\\'
+        OR ${NORMALIZED_SEARCH_EXPRESSION} ILIKE $${keywordParameter} ESCAPE '\\'
+      )`);
+    }
+  }
+
+  if (brand) {
+    values.push(literalContainsPattern(brand));
+    whereConditions.push(`brand ILIKE $${values.length} ESCAPE '\\'`);
+  }
+
+  if (marketCountry) {
+    values.push(marketCountry);
+    whereConditions.push(
+      `lower(coalesce(market_country, '')) = lower($${values.length})`
+    );
+  }
+
+  values.push(limit);
+  const limitParameter = values.length;
+
+  return {
+    text: `SELECT description, brand, market_country, serving_size, serving_size_unit,
+                  calories, protein, carbs, fat,
+                  saturated_fat, trans_fat, monounsat_fat, polyunsat_fat,
+                  fiber, sugar, added_sugars, sugar_alcohol,
+                  sodium, potassium, calcium, iron,
+                  vitamin_a, vitamin_c, vitamin_d, vitamin_b6,
+                  vitamin_b12, vitamin_k1, vitamin_k2
+           FROM foods
+           WHERE ${whereConditions.join(' AND ')}
+           ORDER BY (CASE WHEN ($2 <> '' OR $3 <> '')
+                           AND lower(coalesce(market_country, '')) IN (lower($2), lower($3))
+                          THEN 1 ELSE 0 END) DESC,
+                    ${rankExpression}
+                    * CASE WHEN data_type IN ('foundation_food', 'sr_legacy_food')
+                           THEN 3.0 ELSE 1.0 END DESC
+           LIMIT $${limitParameter}`,
+    values
+  };
 }
 
 function foodFromRow(row) {
@@ -81,6 +181,10 @@ function sendFoods(res, foods) {
 }
 
 async function searchFoods(req, res) {
+  const requestStarted = performance.now();
+  const requestId = randomUUID();
+  res.set('X-Request-ID', requestId);
+
   // Preserve the mobile app's q/country inputs and support the hardened API's
   // search/brand/market_country/limit names on both food-search routes.
   const search = stringQueryValue(req.query.search) || stringQueryValue(req.query.q);
@@ -98,62 +202,80 @@ async function searchFoods(req, res) {
     return sendFoods(res, []);
   }
 
+  const normalizedSearch = normalizeSearch(search);
+  const keywords = normalizedSearch.split(' ').filter(Boolean);
+  const preferredCountryName = countryName || marketCountry;
+  const preferredCountryCode = countryCode;
+  const stages = [];
+  let databaseDurationMs = 0;
+
+  const executeSearch = async mode => {
+    const query = buildFoodSearchQuery({
+      mode,
+      search,
+      brand,
+      marketCountry,
+      preferredCountryName,
+      preferredCountryCode,
+      limit
+    });
+    const queryStarted = performance.now();
+    stages.push(mode);
+    try {
+      const result = await pool.query(query.text, query.values);
+      return result.rows;
+    } finally {
+      databaseDurationMs += performance.now() - queryStarted;
+    }
+  };
+
   try {
-    // Split search into keywords and require every keyword to occur in the
-    // combined description and brand. Apostrophe variants are ignored on both
-    // sides so Egg'd, Egg’d, and Eggd match consistently.
-    const stripQuotes = value => value.replace(/[’'`´]/g, '');
-    const keywords = stripQuotes(search.toLowerCase()).split(/\s+/).filter(Boolean);
-    const preferredCountryName = countryName || marketCountry;
-    const preferredCountryCode = countryCode;
-    const values = [search.toLowerCase(), preferredCountryName, preferredCountryCode];
-    const whereConditions = [];
+    let rows;
+    if (search) {
+      rows = await executeSearch('fts');
 
-    for (const keyword of keywords) {
-      values.push(`%${keyword}%`);
-      whereConditions.push(
-        `REPLACE(REPLACE(REPLACE(LOWER(COALESCE(description, '') || ' ' || COALESCE(brand, '')), '’', ''), '''', ''), '\`', '') ILIKE $${values.length}`
-      );
+      // Only fall back to substring matching when ordinary word search found
+      // nothing. At least one three-character term is required so pg_trgm has
+      // an indexable token and a short query cannot scan the full table.
+      if (rows.length === 0 && keywords.some(keyword => keyword.length >= 3)) {
+        rows = await executeSearch('substring');
+      }
+    } else {
+      rows = await executeSearch('filters');
     }
 
-    if (brand) {
-      values.push(`%${brand}%`);
-      whereConditions.push(`COALESCE(brand, '') ILIKE $${values.length}`);
-    }
-
-    if (marketCountry) {
-      values.push(marketCountry);
-      whereConditions.push(`LOWER(COALESCE(market_country, '')) = LOWER($${values.length})`);
-    }
-
-    values.push(limit);
-    const limitParameter = values.length;
-    const { rows } = await pool.query(
-      `SELECT description, brand, market_country, serving_size, serving_size_unit,
-              calories, protein, carbs, fat,
-              saturated_fat, trans_fat, monounsat_fat, polyunsat_fat,
-              fiber, sugar, added_sugars, sugar_alcohol,
-              sodium, potassium, calcium, iron,
-              vitamin_a, vitamin_c, vitamin_d, vitamin_b6,
-              vitamin_b12, vitamin_k1, vitamin_k2
-       FROM foods
-       WHERE ${whereConditions.join(' AND ')}
-       ORDER BY (CASE WHEN ($2 <> '' OR $3 <> '')
-                       AND LOWER(COALESCE(market_country, '')) IN (LOWER($2), LOWER($3))
-                      THEN 1 ELSE 0 END) DESC,
-                GREATEST(
-                  similarity(LOWER(COALESCE(description, '')), $1),
-                  similarity(LOWER(COALESCE(brand, '')), $1)
-                ) * CASE WHEN data_type IN ('foundation_food', 'sr_legacy_food')
-                         THEN 3.0 ELSE 1.0 END DESC
-       LIMIT $${limitParameter}`,
-      values
-    );
-
+    console.info(JSON.stringify({
+      event: 'food_search',
+      requestId,
+      search: safeLogValue(search),
+      brand: safeLogValue(brand),
+      marketCountry: safeLogValue(marketCountry),
+      limit,
+      stages,
+      resultCount: rows.length,
+      databaseDurationMs: Number(databaseDurationMs.toFixed(1)),
+      requestDurationMs: Number((performance.now() - requestStarted).toFixed(1)),
+      outcome: 'ok'
+    }));
     return sendFoods(res, rows.map(foodFromRow));
   } catch (error) {
-    console.error('Food search failed:', error);
-    return res.status(500).json({ error: 'Food search failed' });
+    const timedOut = isQueryTimeout(error);
+    console.error(JSON.stringify({
+      event: 'food_search',
+      requestId,
+      search: safeLogValue(search),
+      brand: safeLogValue(brand),
+      marketCountry: safeLogValue(marketCountry),
+      limit,
+      stages,
+      databaseDurationMs: Number(databaseDurationMs.toFixed(1)),
+      requestDurationMs: Number((performance.now() - requestStarted).toFixed(1)),
+      outcome: timedOut ? 'timeout' : 'error',
+      errorCode: typeof error.code === 'string' ? error.code.slice(0, 32) : 'UNKNOWN'
+    }));
+    return timedOut
+      ? res.status(504).json({ error: 'Food search timed out' })
+      : res.status(500).json({ error: 'Food search failed' });
   }
 }
 
@@ -206,7 +328,10 @@ if (require.main === module) {
 
 module.exports = {
   app,
+  buildFoodSearchQuery,
   FOOD_CACHE_CONTROL,
+  isQueryTimeout,
+  normalizeSearch,
   requestedLimit,
   searchFoods,
   startServer

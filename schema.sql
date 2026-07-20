@@ -28,6 +28,19 @@ CREATE TABLE IF NOT EXISTS foods (
 );
 
 CREATE INDEX IF NOT EXISTS idx_foods_search ON foods USING GIN(search_tsv);
-CREATE INDEX IF NOT EXISTS idx_foods_trgm ON foods USING GIN(description gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_foods_desc_trgm ON foods USING GIN(description gin_trgm_ops);
 -- Brand trigram index so brand-name search ("burgerfuel") is fast and typo-tolerant.
 CREATE INDEX IF NOT EXISTS idx_foods_brand_trgm ON foods USING GIN(brand gin_trgm_ops);
+-- This expression must remain equivalent to the substring predicate in
+-- server.js. It preserves Egg'd/Eggd matching without a full-table expression
+-- scan.
+CREATE INDEX IF NOT EXISTS idx_foods_normalized_search_trgm ON foods USING GIN (
+  (
+    regexp_replace(
+      lower(coalesce(description, '') || ' ' || coalesce(brand, '')),
+      '[‘’''`´]',
+      '',
+      'g'
+    )
+  ) gin_trgm_ops
+);
